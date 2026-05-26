@@ -51,12 +51,16 @@
     scanlines.style.height = H + 'px';
 
     // ── CONSTANTS ──────────────────────────────────────────────────────────────
-    const TILE         = 40;
-    const PLAYER_SPEED = 180;
-    const BULLET_SPEED = 520;
-    const FIRE_RATE    = 0.14;
-    const PLAYER_R     = 14;
-    const BULLET_R     = 4;
+    const TILE           = 40;
+    const PLAYER_SPEED   = 180;
+    const BULLET_SPEED   = 520;
+    const FIRE_RATE      = 0.14;
+    const PLAYER_R       = 14;
+    const BULLET_R       = 4;
+    const DASH_SPEED     = 700;
+    const DASH_DURATION  = 0.18;
+    const DASH_COOLDOWN  = 0.9;
+    const PICKUP_R       = 12;
 
     const ENEMY_DEFS = {
       grunt:  { color: '#e74c3c', radius: 16, speed: 72,  hp: 1, score: 10 },
@@ -87,7 +91,7 @@
     document.addEventListener('keydown', e => {
       keys[e.key] = true;
       if (e.key === 'Enter') handleEnter();
-      if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
+      if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' ','Shift'].includes(e.key)) e.preventDefault();
     });
     document.addEventListener('keyup', e => { keys[e.key] = false; });
     canvas.addEventListener('mousemove', e => {
@@ -105,7 +109,7 @@
     }
 
     // ── ENTITIES ───────────────────────────────────────────────────────────────
-    let player, enemies, bullets, particles;
+    let player, enemies, bullets, particles, pickups;
 
     class Player {
       constructor() {
@@ -117,6 +121,16 @@
         this.moving = false;
         this.invincible = 0;
         this.flash = 0;
+        // dash
+        this.dashing      = false;
+        this.dashTimer    = 0;
+        this.dashCooldown = 0;
+        this.dashVx       = 0;
+        this.dashVy       = 0;
+        this.dashTrail    = [];
+        // power-ups
+        this.rapidFireTimer  = 0;
+        this.forcefieldTimer = 0;
       }
 
       update(dt) {
@@ -128,19 +142,68 @@
         if (dx !== 0 && dy !== 0) { dx *= 0.707; dy *= 0.707; }
         this.moving = (dx !== 0 || dy !== 0);
 
-        this.x = Math.max(PLAYER_R, Math.min(W - PLAYER_R, this.x + dx * PLAYER_SPEED * dt));
-        this.y = Math.max(PLAYER_R, Math.min(H - PLAYER_R, this.y + dy * PLAYER_SPEED * dt));
-        if (this.moving) this.walkCycle += dt * 9;
+        // dash initiation
+        if ((keys['Shift'] || keys[' ']) && !this.dashing && this.dashCooldown <= 0) {
+          this.dashing   = true;
+          this.dashTimer = DASH_DURATION;
+          const len = Math.hypot(dx, dy);
+          if (len > 0) {
+            this.dashVx = (dx / len) * DASH_SPEED;
+            this.dashVy = (dy / len) * DASH_SPEED;
+          } else {
+            this.dashVx = Math.cos(this.angle) * DASH_SPEED;
+            this.dashVy = Math.sin(this.angle) * DASH_SPEED;
+          }
+          for (let i = 0; i < 8; i++) {
+            const a = Math.random() * Math.PI * 2;
+            particles.push(new Particle(this.x, this.y, Math.cos(a)*160, Math.sin(a)*160, '#88ccff', 0.22));
+          }
+        }
 
+        if (this.dashing) {
+          this.dashTrail.push({ x: this.x, y: this.y });
+          if (this.dashTrail.length > 8) this.dashTrail.shift();
+
+          this.x += this.dashVx * dt;
+          this.y += this.dashVy * dt;
+          this.x = Math.max(PLAYER_R, Math.min(W - PLAYER_R, this.x));
+          this.y = Math.max(PLAYER_R, Math.min(H - PLAYER_R, this.y));
+
+          // damage enemies during dash
+          for (const e of enemies) {
+            if (Math.hypot(e.x - this.x, e.y - this.y) < PLAYER_R + e.radius) {
+              e.takeDashHit(this.dashVx, this.dashVy);
+            }
+          }
+
+          this.dashTimer -= dt;
+          if (this.dashTimer <= 0) {
+            this.dashing      = false;
+            this.dashCooldown = DASH_COOLDOWN;
+            this.dashTrail    = [];
+          }
+        } else {
+          this.dashTrail = [];
+          this.x = Math.max(PLAYER_R, Math.min(W - PLAYER_R, this.x + dx * PLAYER_SPEED * dt));
+          this.y = Math.max(PLAYER_R, Math.min(H - PLAYER_R, this.y + dy * PLAYER_SPEED * dt));
+        }
+
+        if (this.moving && !this.dashing) this.walkCycle += dt * 9;
         this.angle = Math.atan2(mouse.y - this.y, mouse.x - this.x);
 
+        if (this.dashCooldown > 0) this.dashCooldown -= dt;
+
+        const fireRate = this.rapidFireTimer > 0 ? FIRE_RATE * 0.4 : FIRE_RATE;
         this.fireCooldown -= dt;
         if (mouse.down && this.fireCooldown <= 0) {
           this.shoot();
-          this.fireCooldown = FIRE_RATE;
+          this.fireCooldown = fireRate;
         }
-        if (this.invincible > 0) this.invincible -= dt;
-        if (this.flash > 0)      this.flash      -= dt;
+
+        if (this.invincible > 0)     this.invincible     -= dt;
+        if (this.flash > 0)          this.flash           -= dt;
+        if (this.rapidFireTimer > 0) this.rapidFireTimer  -= dt;
+        if (this.forcefieldTimer > 0) this.forcefieldTimer -= dt;
       }
 
       shoot() {
@@ -155,6 +218,16 @@
 
       takeDamage() {
         if (this.invincible > 0) return;
+        if (this.forcefieldTimer > 0) {
+          this.forcefieldTimer = 0;
+          this.invincible = 0.6;
+          screenShake = 0.1;
+          for (let i = 0; i < 14; i++) {
+            const a = Math.random() * Math.PI * 2;
+            particles.push(new Particle(this.x, this.y, Math.cos(a)*180, Math.sin(a)*180, '#44aaff', 0.35));
+          }
+          return;
+        }
         this.hp--;
         this.invincible = 1.3;
         this.flash = 0.1;
@@ -167,11 +240,38 @@
       }
 
       draw() {
-        if (this.invincible > 0 && Math.floor(this.invincible * 10) % 2 === 0) return;
-        const bob = this.moving ? Math.sin(this.walkCycle) * 2.5 : 0;
+        // dash trail
+        for (let i = 0; i < this.dashTrail.length; i++) {
+          const t = this.dashTrail[i];
+          const a = (i / this.dashTrail.length) * 0.35;
+          ctx.globalAlpha = a;
+          ctx.fillStyle = '#88ccff';
+          ctx.beginPath();
+          ctx.arc(t.x, t.y, PLAYER_R * 0.8, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.globalAlpha = 1;
+        }
+
+        if (this.invincible > 0 && !this.dashing && Math.floor(this.invincible * 10) % 2 === 0) return;
+        const bob = this.moving && !this.dashing ? Math.sin(this.walkCycle) * 2.5 : 0;
 
         ctx.save();
         ctx.translate(this.x, this.y);
+
+        // forcefield ring
+        if (this.forcefieldTimer > 0) {
+          const pulse = Math.sin(blinkTimer * 6) * 0.15 + 0.85;
+          ctx.strokeStyle = `rgba(68,170,255,${0.7 * pulse})`;
+          ctx.lineWidth = 3;
+          ctx.beginPath();
+          ctx.arc(0, 0, PLAYER_R + 10, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.strokeStyle = `rgba(180,230,255,${0.3 * pulse})`;
+          ctx.lineWidth = 8;
+          ctx.beginPath();
+          ctx.arc(0, 0, PLAYER_R + 10, 0, Math.PI * 2);
+          ctx.stroke();
+        }
 
         // Shadow
         ctx.fillStyle = 'rgba(0,0,0,0.45)';
@@ -179,20 +279,19 @@
         ctx.ellipse(0, 7 + bob, 13, 6, 0, 0, Math.PI * 2);
         ctx.fill();
 
-        // Body
-        ctx.fillStyle = this.flash > 0 ? '#ffffff' : '#4a9eff';
+        // Body (cyan tint during dash, red flash during hit)
+        ctx.fillStyle = this.flash > 0 ? '#ffffff' : this.dashing ? '#88ccff' : '#4a9eff';
         ctx.beginPath();
         ctx.ellipse(0, bob, 12, 14, 0, 0, Math.PI * 2);
         ctx.fill();
-        // Body sheen
         ctx.fillStyle = 'rgba(255,255,255,0.25)';
         ctx.beginPath();
         ctx.ellipse(-3, bob - 4, 5, 6, -0.3, 0, Math.PI * 2);
         ctx.fill();
 
-        // Gun arm (rotates with mouse angle)
+        // Gun arm
         ctx.rotate(this.angle);
-        ctx.fillStyle = '#888';
+        ctx.fillStyle = this.rapidFireTimer > 0 ? '#ffcc00' : '#888';
         ctx.fillRect(8, -4, 18, 8);
         ctx.fillStyle = '#666';
         ctx.fillRect(22, -3, 8, 6);
@@ -201,14 +300,13 @@
 
         ctx.restore();
 
-        // Head (not rotated)
+        // Head
         ctx.save();
         ctx.translate(this.x, this.y);
         ctx.fillStyle = this.flash > 0 ? '#ffffff' : '#ffd6a5';
         ctx.beginPath();
         ctx.arc(0, bob - 4, 7, 0, Math.PI * 2);
         ctx.fill();
-        // Eyes in direction of movement / mouse
         const ex = Math.cos(this.angle) * 2;
         const ey = Math.sin(this.angle) * 2;
         ctx.fillStyle = '#333';
@@ -230,21 +328,32 @@
         this.color = def.color;
         this.radius = def.radius;
         this.score  = def.score;
-        this.walkCycle = Math.random() * Math.PI * 2;
-        this.angle = 0;
-        this.flashTimer = 0;
+        this.walkCycle      = Math.random() * Math.PI * 2;
+        this.angle          = 0;
+        this.flashTimer     = 0;
+        this.knockbackTimer = 0;
+        this.dashHitCooldown = 0;
+        this.kbVx = 0; this.kbVy = 0;
       }
 
       update(dt) {
+        if (this.knockbackTimer > 0) {
+          this.x += this.kbVx * dt;
+          this.y += this.kbVy * dt;
+          this.kbVx *= 0.82;
+          this.kbVy *= 0.82;
+          this.knockbackTimer -= dt;
+        }
         const dx = player.x - this.x, dy = player.y - this.y;
         const dist = Math.hypot(dx, dy);
-        if (dist > 1) {
+        if (dist > 1 && this.knockbackTimer <= 0) {
           this.x += (dx / dist) * this.speed * dt;
           this.y += (dy / dist) * this.speed * dt;
         }
         this.angle = Math.atan2(dy, dx);
         this.walkCycle += dt * (this.speed / 40);
-        if (this.flashTimer > 0) this.flashTimer -= dt;
+        if (this.flashTimer > 0)      this.flashTimer      -= dt;
+        if (this.dashHitCooldown > 0) this.dashHitCooldown -= dt;
         if (dist < PLAYER_R + this.radius - 4) player.takeDamage();
       }
 
@@ -258,6 +367,22 @@
         if (this.hp <= 0) this.die();
       }
 
+      takeDashHit(dvx, dvy) {
+        if (this.dashHitCooldown > 0) return;
+        this.dashHitCooldown = 0.3;
+        const len  = Math.hypot(dvx, dvy) || 1;
+        const force = 340;
+        this.kbVx = (dvx / len) * force;
+        this.kbVy = (dvy / len) * force;
+        this.knockbackTimer = 0.28;
+        this.hit(1);
+        screenShake = Math.max(screenShake, 0.12);
+        for (let i = 0; i < 8; i++) {
+          const a = Math.atan2(dvy, dvx) + (Math.random() - 0.5) * 1.2;
+          particles.push(new Particle(this.x, this.y, Math.cos(a)*200, Math.sin(a)*200, '#88ccff', 0.25));
+        }
+      }
+
       die() {
         score += this.score;
         for (let i = 0; i < 18; i++) {
@@ -265,11 +390,17 @@
           const spd = 70 + Math.random() * 130;
           particles.push(new Particle(this.x, this.y, Math.cos(a)*spd, Math.sin(a)*spd, this.color, 0.7 + Math.random()*0.3));
         }
-        // Bigger blood pool
         for (let i = 0; i < 8; i++) {
           const a = Math.random() * Math.PI * 2;
           particles.push(new Particle(this.x, this.y, Math.cos(a)*30, Math.sin(a)*30, this.color, 1.5));
         }
+        // random pickup drop
+        const roll = Math.random();
+        let dropType = null;
+        if (roll < 0.10)      dropType = 'health';
+        else if (roll < 0.18) dropType = 'rapidfire';
+        else if (roll < 0.24) dropType = 'forcefield';
+        if (dropType) pickups.push(new Pickup(this.x, this.y, dropType));
       }
 
       draw() {
@@ -438,6 +569,126 @@
       }
     }
 
+    class Pickup {
+      constructor(x, y, type) {
+        this.x    = x; this.y = y;
+        this.type = type;
+        this.life = 8;
+        this.dead = false;
+        this.bob  = Math.random() * Math.PI * 2;
+        this.spin = Math.random() * Math.PI * 2;
+      }
+
+      update(dt) {
+        this.bob  += dt * 3.5;
+        this.spin += dt * 2;
+        this.life -= dt;
+        if (this.life <= 0) { this.dead = true; return; }
+        const dist = Math.hypot(player.x - this.x, player.y - this.y);
+        if (dist < PLAYER_R + PICKUP_R) {
+          this.collect();
+        }
+      }
+
+      collect() {
+        this.dead = true;
+        if (this.type === 'health') {
+          player.hp = Math.min(player.maxHp, player.hp + 2);
+          for (let i = 0; i < 12; i++) {
+            const a = Math.random() * Math.PI * 2;
+            particles.push(new Particle(this.x, this.y, Math.cos(a)*120, Math.sin(a)*120, '#2ecc71', 0.5));
+          }
+        } else if (this.type === 'rapidfire') {
+          player.rapidFireTimer = 6;
+          for (let i = 0; i < 12; i++) {
+            const a = Math.random() * Math.PI * 2;
+            particles.push(new Particle(this.x, this.y, Math.cos(a)*120, Math.sin(a)*120, '#ffe066', 0.5));
+          }
+        } else if (this.type === 'forcefield') {
+          player.forcefieldTimer = 12;
+          for (let i = 0; i < 12; i++) {
+            const a = Math.random() * Math.PI * 2;
+            particles.push(new Particle(this.x, this.y, Math.cos(a)*120, Math.sin(a)*120, '#44aaff', 0.5));
+          }
+        }
+      }
+
+      draw() {
+        const fadeAlpha = this.life < 2 ? this.life / 2 : 1;
+        const by = Math.sin(this.bob) * 4;
+
+        ctx.save();
+        ctx.translate(this.x, this.y + by);
+        ctx.globalAlpha = fadeAlpha;
+
+        // glow ring
+        const glowColor = this.type === 'health' ? '#2ecc71'
+                        : this.type === 'rapidfire' ? '#ffe066' : '#44aaff';
+        const pulse = Math.sin(this.bob * 1.4) * 0.2 + 0.5;
+        ctx.strokeStyle = glowColor;
+        ctx.lineWidth = 2;
+        ctx.globalAlpha = fadeAlpha * pulse;
+        ctx.beginPath();
+        ctx.arc(0, 0, PICKUP_R + 6, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.globalAlpha = fadeAlpha;
+
+        // base circle
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.beginPath();
+        ctx.arc(0, 0, PICKUP_R, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = glowColor;
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        ctx.fillStyle = glowColor;
+
+        if (this.type === 'health') {
+          // cross
+          ctx.fillRect(-2, -7, 4, 14);
+          ctx.fillRect(-7, -2, 14, 4);
+        } else if (this.type === 'rapidfire') {
+          // lightning bolt
+          ctx.rotate(this.spin * 0.1);
+          ctx.beginPath();
+          ctx.moveTo(3, -8);
+          ctx.lineTo(-2, -1);
+          ctx.lineTo(2, -1);
+          ctx.lineTo(-3, 8);
+          ctx.lineTo(2, 1);
+          ctx.lineTo(-2, 1);
+          ctx.closePath();
+          ctx.fill();
+        } else if (this.type === 'forcefield') {
+          // shield
+          ctx.rotate(this.spin * 0.08);
+          ctx.beginPath();
+          ctx.moveTo(0, -8);
+          ctx.lineTo(7, -4);
+          ctx.lineTo(7, 3);
+          ctx.lineTo(0, 9);
+          ctx.lineTo(-7, 3);
+          ctx.lineTo(-7, -4);
+          ctx.closePath();
+          ctx.fill();
+          ctx.fillStyle = 'rgba(0,0,0,0.4)';
+          ctx.beginPath();
+          ctx.moveTo(0, -4);
+          ctx.lineTo(4, -1);
+          ctx.lineTo(4, 3);
+          ctx.lineTo(0, 6);
+          ctx.lineTo(-4, 3);
+          ctx.lineTo(-4, -1);
+          ctx.closePath();
+          ctx.fill();
+        }
+
+        ctx.globalAlpha = 1;
+        ctx.restore();
+      }
+    }
+
     // ── MENU DECOR ─────────────────────────────────────────────────────────────
     let menuEnemies = [];
 
@@ -519,6 +770,7 @@
       player    = new Player();
       bullets   = [];
       particles = [];
+      pickups   = [];
       spawnLevelEnemies();
       gameState = 'PLAYING';
     }
@@ -584,6 +836,43 @@
       ctx.font = '11px "Courier New"';
       ctx.fillStyle = '#666';
       ctx.fillText(`ENEMIES: ${enemies.filter(e => e.hp > 0).length}`, 16, 46);
+
+      // Dash cooldown pip
+      const dashReady = player.dashCooldown <= 0;
+      ctx.fillStyle = dashReady ? '#88ccff' : 'rgba(136,204,255,0.25)';
+      ctx.fillRect(16, 54, 18, 7);
+      if (!dashReady) {
+        const prog = 1 - player.dashCooldown / DASH_COOLDOWN;
+        ctx.fillStyle = '#88ccff';
+        ctx.fillRect(16, 54, 18 * prog, 7);
+      }
+      ctx.font = '9px "Courier New"';
+      ctx.fillStyle = dashReady ? '#88ccff' : '#446';
+      ctx.fillText('DASH', 38, 61);
+
+      // Active power-up bars
+      let pyOff = 68;
+      if (player.rapidFireTimer > 0) {
+        const pw = 80, ph = 7;
+        ctx.fillStyle = 'rgba(0,0,0,0.5)';
+        ctx.fillRect(16, pyOff, pw, ph);
+        ctx.fillStyle = '#ffe066';
+        ctx.fillRect(16, pyOff, pw * (player.rapidFireTimer / 6), ph);
+        ctx.font = '9px "Courier New"';
+        ctx.fillStyle = '#ffe066';
+        ctx.fillText('RAPID', 100, pyOff + 7);
+        pyOff += 12;
+      }
+      if (player.forcefieldTimer > 0) {
+        const pw = 80, ph = 7;
+        ctx.fillStyle = 'rgba(0,0,0,0.5)';
+        ctx.fillRect(16, pyOff, pw, ph);
+        ctx.fillStyle = '#44aaff';
+        ctx.fillRect(16, pyOff, pw * (player.forcefieldTimer / 12), ph);
+        ctx.font = '9px "Courier New"';
+        ctx.fillStyle = '#44aaff';
+        ctx.fillText('SHIELD', 100, pyOff + 7);
+      }
     }
 
     // ── SCREENS ────────────────────────────────────────────────────────────────
@@ -626,7 +915,7 @@
 
       ctx.font = '11px "Courier New"';
       ctx.fillStyle = '#444';
-      ctx.fillText('ARROWS / WASD: MOVE    MOUSE: AIM    CLICK: SHOOT', W/2, H - 18);
+      ctx.fillText('WASD/ARROWS: MOVE    MOUSE: AIM    CLICK: SHOOT    SHIFT/SPACE: DASH', W/2, H - 18);
     }
 
     function drawLevelComplete(dt) {
@@ -659,7 +948,7 @@
       if (levelClearTimer <= 0) {
         level++;
         player.x = W/2; player.y = H/2;
-        bullets = []; particles = [];
+        bullets = []; particles = []; pickups = [];
         spawnLevelEnemies();
         gameState = 'PLAYING';
       }
@@ -724,12 +1013,15 @@
         for (const e of enemies)    e.update(dt);
         for (const b of bullets)    b.update(dt);
         for (const p of particles)  p.update(dt);
+        for (const pk of pickups)   pk.update(dt);
 
         bullets.splice(0,   bullets.length,   ...bullets.filter(b => !b.dead));
         enemies.splice(0,   enemies.length,   ...enemies.filter(e => e.hp > 0));
         particles.splice(0, particles.length, ...particles.filter(p => p.life > 0));
+        pickups.splice(0,   pickups.length,   ...pickups.filter(pk => !pk.dead));
 
         drawFloor();
+        for (const pk of pickups)  pk.draw();
         for (const e of enemies)   e.draw();
         player.draw();
         for (const b of bullets)   b.draw();
